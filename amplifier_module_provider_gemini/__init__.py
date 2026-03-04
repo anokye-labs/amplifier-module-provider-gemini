@@ -62,6 +62,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CLOUDFLARE_403_WARNING = (
+    "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+    "with no details). Treating as transient \u2014 will retry."
+)
+
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
@@ -180,6 +185,11 @@ class GeminiProvider:
         When a CDN/proxy returns a 403, the google-genai SDK wraps it as a
         ClientError with details=None (no JSON body to parse).  Real Gemini
         API 403s always include structured details with an 'error' key.
+
+        Note: this method is used for the ClientError (``genai_errors``) path
+        only.  The fallback ``PermissionDenied`` path uses a broader falsy
+        check (``not getattr(e, 'details', None)``) because google.api_core
+        exceptions may carry empty details (``[]``, ``""``, etc.).
         """
         details = getattr(error, "details", None)
         # No details at all → likely CDN/proxy response
@@ -744,10 +754,7 @@ class GeminiProvider:
                             ) from e
                         if code == 403:
                             if self._is_cloudflare_challenge(e):
-                                logger.warning(
-                                    "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                                    "with no details). Treating as transient — will retry."
-                                )
+                                logger.warning(_CLOUDFLARE_403_WARNING)
                                 raise ProviderUnavailableError(
                                     "CDN/proxy challenge (transient 403). "
                                     "This typically resolves on retry.",
@@ -835,10 +842,7 @@ class GeminiProvider:
                         # google.api_core exceptions may have empty details
                         # ([], "", etc.) which also indicate a CDN/proxy 403.
                         if not getattr(e, "details", None):
-                            logger.warning(
-                                "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                                "with no details). Treating as transient — will retry."
-                            )
+                            logger.warning(_CLOUDFLARE_403_WARNING)
                             raise ProviderUnavailableError(
                                 "CDN/proxy challenge (transient 403). "
                                 "This typically resolves on retry.",
