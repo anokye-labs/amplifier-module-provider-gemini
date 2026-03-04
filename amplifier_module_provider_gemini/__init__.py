@@ -9,6 +9,7 @@ __all__ = ["mount", "GeminiProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+from collections import defaultdict
 import json
 import logging
 import os
@@ -429,7 +430,7 @@ class GeminiProvider:
 
     def _find_missing_tool_results(
         self, messages: list[Message]
-    ) -> list[tuple[str, str, dict]]:
+    ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
         Scans conversation for assistant tool calls and validates each has
@@ -437,17 +438,21 @@ class GeminiProvider:
         Filters out IDs already repaired in previous iterations.
 
         Returns:
-            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
+            List of (msg_index, call_id, tool_name, tool_arguments) tuples for
+            unpaired calls, where msg_index is the index of the assistant message
+            that contains the tool call.
         """
-        tool_calls = {}  # {call_id: (name, args)}
-        tool_results = set()  # {call_id}
+        tool_calls: dict[
+            str, tuple[int, str, dict]
+        ] = {}  # {call_id: (idx, name, args)}
+        tool_results: set[str] = set()  # {call_id}
 
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             # Check assistant messages for ToolCallBlock in content
             if msg.role == "assistant" and isinstance(msg.content, list):
                 for block in msg.content:
                     if hasattr(block, "type") and block.type == "tool_call":
-                        tool_calls[block.id] = (block.name, block.input)
+                        tool_calls[block.id] = (idx, block.name, block.input)
 
             # Check tool messages for tool_call_id
             elif (
@@ -456,8 +461,8 @@ class GeminiProvider:
                 tool_results.add(msg.tool_call_id)
 
         return [
-            (call_id, name, args)
-            for call_id, (name, args) in tool_calls.items()
+            (msg_idx, call_id, name, args)
+            for call_id, (msg_idx, name, args) in tool_calls.items()
             if call_id not in tool_results and call_id not in self._repaired_tool_ids
         ]
 
@@ -501,15 +506,52 @@ class GeminiProvider:
             logger.warning(
                 f"[PROVIDER] Gemini: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
 
-            # Inject synthetic results
-            for call_id, tool_name, _ in missing:
-                synthetic = self._create_synthetic_result(call_id, tool_name)
-                request.messages.append(synthetic)
-                # Track this ID so we don't detect it as missing again in future iterations
-                self._repaired_tool_ids.add(call_id)
+            # Group missing results by the index of their source assistant message
+            # so that synthetics are inserted immediately after that message,
+            # preserving the required tool_call → tool_result → ... ordering.
+            by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
+            for msg_idx, call_id, tool_name, _ in missing:
+                by_msg_idx[msg_idx].append((call_id, tool_name))
+
+            # Process groups in reverse order so that earlier insertions don't
+            # shift the indices of later groups that haven't been processed yet.
+            for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
+                synthetics = []
+                for call_id, tool_name in by_msg_idx[msg_idx]:
+                    synthetics.append(self._create_synthetic_result(call_id, tool_name))
+                    # Track this ID so we don't detect it as missing again in future iterations
+                    self._repaired_tool_ids.add(call_id)
+
+                insert_pos = msg_idx + 1
+                for i, synthetic in enumerate(synthetics):
+                    request.messages.insert(insert_pos + i, synthetic)
+
+                # FM3: If a real user message immediately follows the injected synthetics,
+                # the assistant turn is incomplete (tool calls with no follow-up assistant
+                # text). Insert a minimal assistant bridge to satisfy the API's alternating
+                # turn requirement before the user message.
+                post_insert_idx = insert_pos + len(synthetics)
+                if post_insert_idx < len(request.messages):
+                    next_msg = request.messages[post_insert_idx]
+                    is_real_user_msg = (
+                        next_msg.role == "user"
+                        and not getattr(next_msg, "tool_call_id", None)
+                        and not (
+                            isinstance(next_msg.content, str)
+                            and next_msg.content.startswith("<system-reminder>")
+                        )
+                    )
+                    if is_real_user_msg:
+                        assistant_bridge = Message(
+                            role="assistant",
+                            content=(
+                                "[SYSTEM: Tool results received. Continuing conversation.]"
+                            ),
+                        )
+                        request.messages.insert(post_insert_idx, assistant_bridge)
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -520,7 +562,7 @@ class GeminiProvider:
                         "repair_count": len(missing),
                         "repairs": [
                             {"tool_call_id": call_id, "tool_name": tool_name}
-                            for call_id, tool_name, _ in missing
+                            for _, call_id, tool_name, _ in missing
                         ],
                     },
                 )
@@ -1410,4 +1452,3 @@ class GeminiProvider:
     async def close(self) -> None:
         """Release the genai client reference."""
         self._client = None
-
